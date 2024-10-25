@@ -1,3 +1,8 @@
+/***********************************************************************
+     Copyright (c) 2024 GNU/Linux Users' Group (NIT Durgapur)
+     Author: Dhruba Sinha
+************************************************************************/
+
 
 /* 
     Task structure definition
@@ -41,6 +46,10 @@ struct task {
 */
 struct task_result {
     int status;
+    int exitCode;
+    int signal;
+    unsigned long execTime;       // in miliseconds
+    unsigned long memoryUsed;     // in kilobytes
     char *errorMsg;
 };
 
