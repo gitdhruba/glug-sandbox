@@ -17,7 +17,18 @@ typedef struct syscall_entry SyscallEntry;
 
 // array of syscalls that are not allowed
 const SyscallEntry disallowed_syscalls[] = {
+    // {2, "open"},
+    // {4, "stat"},
+    // {5, "fstat"},
+    // {6, "lstat"},
+    // {7, "poll"},
+    // {16, "ioctl"},
+    // {}
 
+    {SYS_clone, "clone"},
+    {SYS_clone3, "clone3"},
+    {SYS_fork, "fork"},
+    {SYS_execve, "execve"},
 };
 
 
@@ -26,9 +37,9 @@ const SyscallEntry disallowed_syscalls[] = {
     if allowed, return -1
     else return the index of that syscall in the array disallowed_syscalls
 */
-int isDisallowedSyscall(long syscallNo) {
-    int n = sizeof(disallowed_syscalls) / sizeof(SyscallEntry);
-    for (int i = 0; i < n; i++) {
+long getSyscallIndex(long syscallNo) {
+    long n = sizeof(disallowed_syscalls) / sizeof(SyscallEntry);
+    for (long i = 0; i < n; i++) {
         if (disallowed_syscalls[i].syscallNo == syscallNo) return i;
     }
 
