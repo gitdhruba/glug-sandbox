@@ -1,5 +1,5 @@
 /***********************************************************************
-     Copyright (c) 2024 GNU/Linux Users' Group (NIT Durgapur)
+     Copyright (c) 2025 GNU/Linux Users' Group (NIT Durgapur)
      Author: Dhruba Sinha
 ************************************************************************/
 
@@ -8,8 +8,8 @@
 
 
 struct syscall_entry {
-    long syscallNo;
-    char *syscallName;
+    long syscall_no;
+    char *syscall_name;
 };
 
 typedef struct syscall_entry SyscallEntry;
@@ -37,10 +37,10 @@ const SyscallEntry disallowed_syscalls[] = {
     if allowed, return -1
     else return the index of that syscall in the array disallowed_syscalls
 */
-long getSyscallIndex(long syscallNo) {
+long getSyscallIndex(long syscall_no) {
     long n = sizeof(disallowed_syscalls) / sizeof(SyscallEntry);
     for (long i = 0; i < n; i++) {
-        if (disallowed_syscalls[i].syscallNo == syscallNo) return i;
+        if (disallowed_syscalls[i].syscall_no == syscall_no) return i;
     }
 
     return -1;
