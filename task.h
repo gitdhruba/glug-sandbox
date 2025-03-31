@@ -1,5 +1,5 @@
 /***********************************************************************
-     Copyright (c) 2024 GNU/Linux Users' Group (NIT Durgapur)
+     Copyright (c) 2025 GNU/Linux Users' Group (NIT Durgapur)
      Author: Dhruba Sinha
 ************************************************************************/
 
@@ -10,32 +10,32 @@
 struct task {
 
     // executable file path
-    char *execPath;
+    char *exec_path;
 
-    // arguments to excutable
+    // arguments to executable
     char **args;
 
     // root for chroot
     char *root;
 
     // input file
-    char *inputFile;
+    char *input_file;
 
     // output file
-    char *outputFile;
+    char *output_file;
 
     // error file
-    char *errorFile;
+    char *error_file;
 
     // resource limits
     // cpu
-    unsigned long maxCpuTime;
+    unsigned long max_cpu_time;
 
     // memory
-    unsigned long maxMemory;
+    unsigned long max_memory;
 
     // output file size
-    unsigned long maxFileSize;
+    unsigned long max_file_size;
 
 };
 
@@ -46,11 +46,11 @@ struct task {
 */
 struct task_result {
     int status;
-    int exitCode;
+    int exit_code;
     int signal;
-    unsigned long execTime;       // in miliseconds
-    unsigned long memoryUsed;     // in kilobytes
-    char *errorMsg;
+    unsigned long exec_time;       // in milliseconds
+    unsigned long memory_used;     // in kilobytes
+    char *error_msg;
 };
 
 
