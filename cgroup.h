@@ -27,7 +27,7 @@ int create_cgroup() {
     }
 
     // enable cgroup controllers for sandbox cgroup
-    char subtree_control_path[256];
+    char subtree_control_path[256] = {0};
     sprintf(subtree_control_path, "%s/cgroup.subtree_control", root_cgroup);
     FILE *fp = fopen(subtree_control_path, "w");
     if (fp == NULL) {
@@ -46,6 +46,45 @@ int create_cgroup() {
     // ceate cgroup directory
     if (mkdir(sandbox_cgroup, 0755) == -1) {
         fprintf(stderr, "[X] couldn't create cgroup directory\n");
+        return -1;
+    }
+
+    return 0;
+}
+
+// set memory limit for the cgroup
+int set_memory_limit(long high, long max) {
+    FILE *fp;
+    char memory_limit_path[256] = {0};
+    int bytes_written = 0;
+
+    // set high
+    sprintf(memory_limit_path, "%s/memory.high", sandbox_cgroup);
+    fp = fopen(memory_limit_path, "w");
+    if (fp == NULL) {
+        fprintf(stderr, "[X] couldn't open memory.high\n");
+        return -1;
+    }
+
+    bytes_written = fprintf(fp, "%ld", high);
+    fclose(fp);
+    if (bytes_written < 0) {
+        fprintf(stderr, "[X] couldn't write to memory.high\n");
+        return -1;
+    }
+
+    // set max
+    sprintf(memory_limit_path, "%s/memory.max", sandbox_cgroup);
+    fp = fopen(memory_limit_path, "w");
+    if (fp == NULL) {
+        fprintf(stderr, "[X] couldn't open memory.high\n");
+        return -1;
+    }
+
+    bytes_written = fprintf(fp, "%ld", max);
+    fclose(fp);
+    if (bytes_written < 0) {
+        fprintf(stderr, "[X] couldn't write to memory.high\n");
         return -1;
     }
 
