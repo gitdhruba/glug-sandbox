@@ -12,15 +12,15 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <stdio.h>
-#include <unistd.h>
 #include <string.h>
 
 #include "./task.h"
 #include "./syscalls.h"
 #include "./signals.h"
 
+#define SANDBOX_UID (uid_t)65534
+#define SANDBOX_GID (gid_t)65534
 
-#define MAX_ALLOWED_MEMORY (2ll << 30)
 #define CPULIMIT_CURR_MAX_PADDING 4
 #define MEMORYLIMIT_PADDING (getpagesize() << 16)
 #define COREDUMPLIMIT 0
@@ -34,9 +34,11 @@
 #define ERR_SETMEMORYLIMIT 15
 #define ERR_SETFSIZELIMIT 16
 #define ERR_SETCORELIMIT 17
-#define ERR_CHROOT 18
+#define ERR_CHDIR 18
 #define ERR_PTRACE 19
 #define ERR_EXEC 20
+#define ERR_SETUID 21
+#define ERR_NULLFD 22
 
 
 
@@ -57,43 +59,55 @@ unsigned long get_memory_usage(pid_t pid) {
     return mem_usage;
 }
 
-void sandbox(const Task *task) {
 
-    /********** prepare stdin, stdout, stderr **********/
-    if (freopen(task->input_file, "r", stdin) == NULL) exit(ERR_SETSTDIN);
-    if (freopen(task->output_file, "w", stdout) == NULL) exit(ERR_SETSTDOUT);
-    if (freopen(task->error_file, "w", stderr) == NULL) exit(ERR_SETSTDERR);
+void sandbox(const Task *task) {
 
     /********** set resource limits **********/
     struct rlimit resource_limit;
     // cpu limit
-    resource_limit.rlim_cur = task->max_cpu_time;
-    resource_limit.rlim_max = task->max_cpu_time + CPULIMIT_CURR_MAX_PADDING;
+    resource_limit.rlim_max = resource_limit.rlim_cur = task->max_cpu_time;
     if (setrlimit(RLIMIT_CPU, &resource_limit) < 0) exit(ERR_SETTIMELIMIT);
-    // memory limit
-    resource_limit.rlim_max = resource_limit.rlim_cur = MAX_ALLOWED_MEMORY;
-    if (setrlimit(RLIMIT_AS, &resource_limit) < 0) exit(ERR_SETMEMORYLIMIT);
+    // memory limit (already set in cgroup)
+    // resource_limit.rlim_max = resource_limit.rlim_cur = MAX_ALLOWED_MEMORY;
+    // if (setrlimit(RLIMIT_AS, &resource_limit) < 0) exit(ERR_SETMEMORYLIMIT);
+
     // output file size limit
     resource_limit.rlim_max = resource_limit.rlim_cur = task->max_file_size;
     if (setrlimit(RLIMIT_FSIZE, &resource_limit) < 0) exit(ERR_SETFSIZELIMIT);
+    
     // core-dump limit (shouldn't generate core dump)
     resource_limit.rlim_max = resource_limit.rlim_cur = COREDUMPLIMIT;
     if (setrlimit(RLIMIT_CORE, &resource_limit) < 0) exit(ERR_SETCORELIMIT);
 
     /********** change root dir **********/
-    // if ((chdir(task->root) < 0) || (chroot(".") < 0)) exit(ERR_CHROOT);
+    if (chdir(task->work_dir) < 0) exit(ERR_CHDIR);
+
+    /********** set user and group ids to unprivileged one ****************/
+    if ((setgid(SANDBOX_GID) < 0) || (setuid(SANDBOX_UID) < 0)) exit(ERR_SETUID);
+    if ((geteuid() != SANDBOX_UID) || (getegid() != SANDBOX_GID)) exit(ERR_SETUID);
+
+    /********** set standard input/output/error files **********/
+    if ((task->input_file == NULL) || (task->output_file == NULL) || (task->error_file == NULL)) exit(ERR_NULLFD);
+    // set standard input
+    if (freopen(task->input_file, "r", stdin) == NULL) exit(ERR_SETSTDIN);
+    // set standard output
+    if (freopen(task->output_file, "w", stdout) == NULL) exit(ERR_SETSTDOUT);
+    // set standard error
+    if (freopen(task->error_file, "w", stderr) == NULL) exit(ERR_SETSTDERR);
 
     /********** start being traced by monitor ***********/
     if (ptrace(PTRACE_TRACEME, -1, NULL, NULL) < 0) exit(ERR_PTRACE);
 
     // now keep itself stopped until continued by parent
-    kill(getpid(), SIGSTOP);            
+    raise(SIGSTOP);            
 
     /********** execute task ***********/
     // (###)
     // ATTENTION: this is the very first exec() call which should be ignored in monitor, otherwise user program wouldn't be executed
     if (execv(task->exec_path, task->args) < 0) exit(ERR_EXEC);
 }
+
+
 
 void monitor(const Task *task, pid_t sandbox_pid, TaskResult *result) {
 
@@ -217,7 +231,6 @@ void monitor(const Task *task, pid_t sandbox_pid, TaskResult *result) {
 }
 
 TaskResult secure_execute(const Task *task) {
-
     TaskResult result;
     result.status = 0;
     result.exit_code = -1;
@@ -226,18 +239,42 @@ TaskResult secure_execute(const Task *task) {
     result.error_msg = (char *)malloc(256);
     memset(result.error_msg, 0, sizeof(result.error_msg));
 
-    // create child process for executing task
-    pid_t pid = fork();
-    if (pid < 0) {
-        result.error_msg = "couldn't create child process";
+    // setup sandbox cgroup
+    int cgroup_fd = setup_sandbox_cgroup(task->max_memory);
+    if (cgroup_fd == -1) {
+        sprintf(result.error_msg, "couldn't setup cgroup");
+        return result;
     }
-    else if (pid == 0) {            // child
-        sandbox(task);
-    }
-    else {                          // parent
-        monitor(task, pid, &result);
 
-    }    
+    // create child process for executing task using clone3() syscall 
+    struct clone_args cl_args;
+    memset(&cl_args, 0, sizeof(cl_args));
+    cl_args.flags = (     CLONE_NEWPID          // new pid namespace to prevent dangerous syscalls like kill(), reboot() etc from hampering the host
+                        | CLONE_CLEAR_SIGHAND   // restore signal handlers to default
+                        | CLONE_INTO_CGROUP     // attach to cgroup while creating the child, as doing it later will slower
+                    );
+    cl_args.cgroup = cgroup_fd;                 // cgroup fd to be used in clone3
+    cl_args.exit_signal = SIGCHLD;              // child will send SIGCHLD to parent when it exits
+    
+    errno = 0;
+    pid_t child = clone3(&cl_args);
+
+    // before proceeding further we have to close the cgroup_fd, as we don't need it anymore
+    close(cgroup_fd);
+
+    if (child == -1) {
+        fprintf(stderr, "[X] clone3 error, couldn't create child process : %d\n", errno);
+        return result;
+    }
+
+    // child process, never returns
+    if (child == 0) {
+        sandbox(task);
+        exit(0);
+    }
+
+    // parent process
+    monitor(task, child, &result);
 
     return result;     
 }

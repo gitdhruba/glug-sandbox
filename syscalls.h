@@ -5,6 +5,8 @@
 
 
 #include <sys/syscall.h>
+#include <linux/sched.h>
+#include <unistd.h>
 
 
 struct syscall_entry {
@@ -25,10 +27,11 @@ const SyscallEntry disallowed_syscalls[] = {
     // {16, "ioctl"},
     // {}
 
-    {SYS_clone, "clone"},
-    {SYS_clone3, "clone3"},
-    {SYS_fork, "fork"},
+    // {SYS_clone, "clone"},
+    // {SYS_clone3, "clone3"},
+    // {SYS_fork, "fork"},
     {SYS_execve, "execve"},
+    // {SYS_reboot}
 };
 
 
@@ -37,11 +40,17 @@ const SyscallEntry disallowed_syscalls[] = {
     if allowed, return -1
     else return the index of that syscall in the array disallowed_syscalls
 */
-long getSyscallIndex(long syscall_no) {
+long get_syscall_index(long syscall_no) {
     long n = sizeof(disallowed_syscalls) / sizeof(SyscallEntry);
     for (long i = 0; i < n; i++) {
         if (disallowed_syscalls[i].syscall_no == syscall_no) return i;
     }
 
     return -1;
+}
+
+
+// custom wrapper function SYS_clone3
+pid_t clone3(struct clone_args *cl_args) {   
+    return (pid_t)syscall(SYS_clone3, cl_args, sizeof(struct clone_args));  // use raw syscall interface
 }

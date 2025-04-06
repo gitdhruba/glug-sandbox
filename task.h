@@ -15,8 +15,8 @@ struct task {
     // arguments to executable
     char **args;
 
-    // root for chroot
-    char *root;
+    // working directory
+    char *work_dir;
 
     // input file
     char *input_file;

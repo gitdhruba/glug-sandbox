@@ -6,9 +6,9 @@
 #include "sandbox.c"
 
 int main() {
-    char *args[] = {"a.out", NULL};
+    char *args[] = {"python3", "./test/test.py", NULL};
     Task task;
-    task.exec_path = "./test/a.out";
+    task.exec_path = "/bin/python3";
     task.args = args;
     task.input_file = "./test/in";
     task.output_file = "./test/out";
