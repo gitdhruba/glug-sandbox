@@ -10,7 +10,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 
-#define MAX_ALLOWED_MEMORY (1ull << 30)
+#define MAX_ALLOWED_MEMORY (512ull << 20)  // 512 MiB
 #define MAX_PIDS_LIMIT 1
 
 const char *root_cgroup = "/sys/fs/cgroup/user.slice";
@@ -78,7 +78,10 @@ int create_cgroup() {
 }
 
 // set memory limit for the cgroup
-int set_memory_limit(unsigned long high, unsigned long max = MAX_ALLOWED_MEMORY) {
+int set_memory_limit(unsigned long high, unsigned long max) {
+    max = (max > MAX_ALLOWED_MEMORY) ? MAX_ALLOWED_MEMORY : max;
+    high = (high > max) ? max : high;
+
     char memory_limit_path[256] = {0};
     char high_str[32], max_str[32];
 
@@ -102,13 +105,13 @@ int set_memory_limit(unsigned long high, unsigned long max = MAX_ALLOWED_MEMORY)
 }
 
 // set pids limit for the cgroup
-int set_pids_limit(long max) {
+int set_pids_limit(unsigned long max) {
     char pids_limit_path[256] = {0};
     char max_str[32];
 
     // set pids.max
     sprintf(pids_limit_path, "%s/pids.max", sandbox_cgroup);
-    sprintf(max_str, "%ld", max);
+    sprintf(max_str, "%lu", max);
     if (write_to_file(pids_limit_path, max_str) == -1) {
         fprintf(stderr, "[X] couldn't write to pids.max\n");
         return -1;
@@ -120,13 +123,13 @@ int set_pids_limit(long max) {
 // setup sandbox cgroup for a given task 
 // return cgroup fd to be used in clone3
 // currently only applies limit on memory and pids controllers
-int setup_sandbox_cgroup(unsigned long memory_limit, long pids_limit = MAX_PIDS_LIMIT) {
+int setup_sandbox_cgroup(unsigned long memory_limit, unsigned long pids_limit) {
     // create cgroup
     // assume that it is already created for now
     // if (create_cgroup() == -1) return -1;
 
     // set memory limit
-    if (set_memory_limit(memory_limit) == -1) return -1;
+    if (set_memory_limit(memory_limit, memory_limit) == -1) return -1;
 
     // set pids limit
     if (set_pids_limit(pids_limit) == -1) return -1;
@@ -139,7 +142,7 @@ int setup_sandbox_cgroup(unsigned long memory_limit, long pids_limit = MAX_PIDS_
     }
 
     return cgroup_fd;
-    // should be closed after use in clone3
+    // should be closed after use in clone3()
 }
 
 // get cpu time from cpu.stat file
@@ -169,8 +172,31 @@ unsigned long get_peak_memory_usage() {
     fscanf(memory_usage_file, "%lu\n", &memory_usage);
     fclose(memory_usage_file);
 
-    // reset memory usage to 0
-    write_to_file(memory_usage_path, "0");
-
     return memory_usage;
+}
+
+// get memory events from memory.events file
+int get_memory_events(CgroupMemoryEvents *events) {
+    char memory_events_path[256] = {0};
+    sprintf(memory_events_path, "%s/memory.events", sandbox_cgroup);
+
+    FILE *memory_events_file = fopen(memory_events_path, "r");
+    if (memory_events_file == NULL) return -1;
+
+    fscanf(memory_events_file, "low %lu\n", &events->low);
+    fscanf(memory_events_file, "high %lu\n", &events->high);
+    fscanf(memory_events_file, "max %lu\n", &events->max);
+    fscanf(memory_events_file, "oom %lu\n", &events->oom);
+    fscanf(memory_events_file, "oom_kill %lu\n", &events->oom_kill);
+    fscanf(memory_events_file, "oom_group_kill %lu\n", &events->oom_group_kill);
+
+    fclose(memory_events_file);
+    return 0;
+}
+
+// reset memory.peak
+int reset_memory_peak() {
+    char memory_peak_path[256] = {0};
+    sprintf(memory_peak_path, "%s/memory.peak", sandbox_cgroup);
+    return write_to_file(memory_peak_path, "0");
 }

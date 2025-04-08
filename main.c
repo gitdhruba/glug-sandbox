@@ -6,17 +6,19 @@
 #include "sandbox.c"
 
 int main() {
-    char *args[] = {"python3", "./test/test.py", NULL};
+    char *args[] = {"python3", "/home/sandbox/test.py", NULL};
     Task task;
     task.exec_path = "/bin/python3";
     task.args = args;
-    task.input_file = "./test/in";
-    task.output_file = "./test/out";
-    task.error_file = "./test/error";
+    task.work_dir = "./test";
+    task.input_file = "./in";
+    task.output_file = "./out";
+    task.error_file = "./error";
     task.max_cpu_time = 2;
     task.max_memory = 256 * 1024 * 1024;
     task.max_file_size = 32768;
-    task.root = "./test";
+    task.max_processes = 1;
+    
 
     TaskResult res = secure_execute(&task);
     printf("status: %d\n", res.status);

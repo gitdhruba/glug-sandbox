@@ -2,7 +2,7 @@
      Copyright (c) 2025 GNU/Linux Users' Group (NIT Durgapur)
      Author: Dhruba Sinha
 ************************************************************************/
-
+#define _GNU_SOURCE
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/time.h>
@@ -17,6 +17,7 @@
 #include "./task.h"
 #include "./syscalls.h"
 #include "./signals.h"
+#include "./cgroup.h"
 
 #define SANDBOX_UID (uid_t)65534
 #define SANDBOX_GID (gid_t)65534
@@ -41,7 +42,6 @@
 #define ERR_NULLFD 22
 
 
-
 unsigned long get_memory_usage(pid_t pid) {
     long page_size = getpagesize();
     char filename[128];
@@ -61,11 +61,10 @@ unsigned long get_memory_usage(pid_t pid) {
 
 
 void sandbox(const Task *task) {
-
     /********** set resource limits **********/
     struct rlimit resource_limit;
     // cpu limit
-    resource_limit.rlim_max = resource_limit.rlim_cur = task->max_cpu_time;
+    resource_limit.rlim_max = resource_limit.rlim_cur = task->max_cpu_time + 1ull;
     if (setrlimit(RLIMIT_CPU, &resource_limit) < 0) exit(ERR_SETTIMELIMIT);
     // memory limit (already set in cgroup)
     // resource_limit.rlim_max = resource_limit.rlim_cur = MAX_ALLOWED_MEMORY;
@@ -79,12 +78,12 @@ void sandbox(const Task *task) {
     resource_limit.rlim_max = resource_limit.rlim_cur = COREDUMPLIMIT;
     if (setrlimit(RLIMIT_CORE, &resource_limit) < 0) exit(ERR_SETCORELIMIT);
 
-    /********** change root dir **********/
-    if (chdir(task->work_dir) < 0) exit(ERR_CHDIR);
-
     /********** set user and group ids to unprivileged one ****************/
     if ((setgid(SANDBOX_GID) < 0) || (setuid(SANDBOX_UID) < 0)) exit(ERR_SETUID);
     if ((geteuid() != SANDBOX_UID) || (getegid() != SANDBOX_GID)) exit(ERR_SETUID);
+
+    /********** change working directory **********/
+    if (chdir(task->work_dir) < 0) exit(ERR_CHDIR);
 
     /********** set standard input/output/error files **********/
     if ((task->input_file == NULL) || (task->output_file == NULL) || (task->error_file == NULL)) exit(ERR_NULLFD);
@@ -98,8 +97,8 @@ void sandbox(const Task *task) {
     /********** start being traced by monitor ***********/
     if (ptrace(PTRACE_TRACEME, -1, NULL, NULL) < 0) exit(ERR_PTRACE);
 
-    // now keep itself stopped until continued by parent
-    raise(SIGSTOP);            
+    // // now keep itself stopped until continued by parent
+    // raise(SIGSTOP);            
 
     /********** execute task ***********/
     // (###)
@@ -109,138 +108,126 @@ void sandbox(const Task *task) {
 
 
 
-void monitor(const Task *task, pid_t sandbox_pid, TaskResult *result) {
-
-    struct rusage resource_usage;
-    const long offset_for_orig_rax = sizeof(long) * ORIG_RAX;
-    long curr_mem_usage = 0;
-    long max_mem_usage = 0;
-    long ptrace_res = 0;
-    long syscall_no = -1;
+void monitor(pid_t sandbox_pid, const Task *task, TaskResult *result) {
     int status = 0;
     int signal = 0;
+    unsigned long cpu_time_start = 0, cpu_time_curr = 0;
+    unsigned long memory_used = 0;
+    CgroupMemoryEvents memory_events_start, memory_events_curr;
+    memset(&memory_events_start, 0, sizeof(memory_events_start));
+    memset(&memory_events_curr, 0, sizeof(memory_events_curr));
 
-    // check whether all setup is done properly before being traced
-    wait4(sandbox_pid, &status, 0, NULL);
+    // wait for child to call first execv() to run user program
+    waitpid(sandbox_pid, &status, 0);
+
+    // check if child exited before execv()
     if (WIFEXITED(status)) {
+        result->exec_time = 0;
+        result->memory_used = 0;
+        sprintf(result->error_msg, "child exited before execv()");
         result->exit_code = WEXITSTATUS(status);
-        result->error_msg = "couldn't execute program";
+        result->signal = -1;
+        printf("mempeak: %d\n", reset_memory_peak());
         return;
     }
 
-    // PTRACE_O_EXITKILL for keeping sandbox under supervision
-    // PTRACE_O_TRACESYSGOOD for sets bit 7 in the signal number (i.e., deliver SIGTRAP|0x80) when delivering syscall-traps
-    errno = 0;
-    ptrace_res = ptrace(PTRACE_SETOPTIONS, sandbox_pid, 0, (PTRACE_O_EXITKILL | PTRACE_O_TRACESYSGOOD));
-    if (ptrace_res == -1) {
-        fprintf(stderr, "[X] ptrace error : %d\n", errno);
+    // if the stop signal is not SIGTRAP, then some error has occured. kill child
+    if (WIFSTOPPED(status) && (WSTOPSIG(status) != SIGTRAP)) {
         kill(sandbox_pid, SIGKILL);
+
+        result->exec_time = 0;
+        result->memory_used = 0;
+        sprintf(result->error_msg, "child terminated before execv()");
+        result->exit_code = -1;
+        result->signal = WSTOPSIG(status);
+        
         return;
     }
 
-    // start monitoring
-    int syscall_filter_flag = 0;
-    while (1) {   
-        // let the sandbox continue till next syscall-stop/signal-stop
-        errno = 0;
-        ptrace_res = ptrace(PTRACE_SYSCALL, sandbox_pid, NULL, signal); 
-        if (ptrace_res == -1) {
-            fprintf(stderr, "[X] ptrace error : %d\n", errno);
-            kill(sandbox_pid, SIGKILL);
-            break;
-        }
+    // at this point, we are sure that child has called execv() and will start running user program
+    // but before continuing ...
+    // set PTRACE_O_EXITKILL option such that sandbox can't rescue even after monitor dies accidentally
+    ptrace(PTRACE_SETOPTIONS, sandbox_pid, NULL, PTRACE_O_EXITKILL);
+    // reset memory.peak
+    reset_memory_peak();
+    // get initial cpu time and memory events from cgroup
+    get_memory_events(&memory_events_start);
+    cpu_time_start = get_cpu_time();
 
-        // wait for sandbox for a state change        
-        wait4(sandbox_pid, &status, 0, &resource_usage);
+    // continue the child process
+    ptrace(PTRACE_CONT, sandbox_pid, NULL, 0);
 
-        // check if exited
-        if (WIFEXITED(status)) {
-            result->status = 1;
-            result->exit_code = WEXITSTATUS(status);
-            result->error_msg = (result->exit_code ? "NZEC" : "NONE") ;
-            break;
-        }
+    // track cpu time , memory usage and child's state changes in a loop until child exits or is killed
+    do {
+        // get child state update using waitpid
+        pid_t res = waitpid(sandbox_pid, &status, WNOHANG);
+        if (res == -1) break;
 
-        // check if signaled
-        else if (WIFSIGNALED(status)) {
-            signal = WTERMSIG(status);
-            result->signal = signal;
-            printf("received signal: %s\n", signal_name[signal]);
+        // get current cpu time and memory_events
+        cpu_time_curr = get_cpu_time();
+        get_memory_events(&memory_events_curr);
 
-            // if terminated due to MLE
-            if ((max_mem_usage > task->max_memory) && (signal == SIGSEGV)) result->error_msg = "MLE";
-            // if terminated due to TLE
-            else if (signal == SIGXCPU) result->error_msg = "TLE";
-            // if terminated due to File size limit
-            else if (signal == SIGXFSZ) result->error_msg = "OLE";
-            // other signals
-            else sprintf(result->error_msg, "signalled: %s", signal_name[signal]);
+        // check if cpu time limit is exceeded or memory limit is exceeded
+        if (((cpu_time_curr - cpu_time_start) > (task->max_cpu_time * 1000000))  // tle
+            || (memory_events_curr.max > memory_events_start.max)                // mle
+           ) kill(sandbox_pid, SIGKILL);
 
-            break;
-        }
-
-        // stopped
-        else {
-            // signal that caused the stop
-            signal = WSTOPSIG(status);
-
-            // ignore first successful exec()
-            // check (###) marked code in sandbox()
-            if ((!syscall_filter_flag) && (signal == SIGTRAP)) {
-                syscall_filter_flag = 1;
-                signal = 0;             // this SIGTRAP shouldn't be delivered
-            }
-
-            // check if it is a syscall-stop
-            if (signal == SYSCALL_STOPSIG) {
-                signal = 0;
-                syscall_no = ptrace(PTRACE_PEEKUSER, sandbox_pid, offset_for_orig_rax, NULL);
-                if (syscall_no == -1) {
-                    fprintf(stderr, "[X] ptrace error : %d\n", errno);
-                    kill(sandbox_pid, SIGKILL);
-                    break;
-                }
-
-                printf("[>>] syscall used: %ld\n", syscall_no);
-
-                long idx = get_syscall_index(syscall_no);
-                if (syscall_filter_flag && (idx != -1)) {
-                    // invoked a prohibited syscall
-                    signal = SIGTERM;
-                    sprintf(result->error_msg, "prohibited syscall used: %s", disallowed_syscalls[idx].syscall_name);
-                }
-            }
-
-            // if it is signal-delivery-stop we don't need to do anything. Let the signal be delivered at next ptrace()
-
-            // get the updated memory usage
-            curr_mem_usage = get_memory_usage(sandbox_pid);
-            max_mem_usage = (curr_mem_usage > max_mem_usage ? curr_mem_usage : max_mem_usage);
-
-            // check for MLE, if yes then SIGSEGV will be delivered
-            if (max_mem_usage > task->max_memory) signal = SIGSEGV;
-            
-            // update resource usages
-            result->exec_time = ((resource_usage.ru_utime.tv_sec + resource_usage.ru_stime.tv_sec) * 1000) + ((resource_usage.ru_utime.tv_usec + resource_usage.ru_stime.tv_usec) / 1000);   // in milliseconds
-            result->memory_used = max_mem_usage >> 10;                                                                                                                                     // in KB
+        // check for signal-delivery stop
+        if ((res != 0) && WIFSTOPPED(status)) {
+            // do nothing, let the signal be delivered to the child
+            ptrace(PTRACE_CONT, sandbox_pid, NULL, WSTOPSIG(status));   // this call may not be successful in case of tle
         }
         
+    } while ((!WIFEXITED(status)) && (!WIFSIGNALED(status)));
+    
+    // at this point, we are sure that child has exited or terminated
+    // get cpu-time, peak memory usage and memory_events 
+    cpu_time_curr = get_cpu_time();
+    memory_used = get_peak_memory_usage();
+    get_memory_events(&memory_events_curr);
+
+    result->exec_time = (cpu_time_curr - cpu_time_start); 
+    result->memory_used = memory_used;  
+    result->status = 1;
+
+    // if exited normally
+    if (WIFEXITED(status)) {
+        result->exit_code = WEXITSTATUS(status);
+        result->signal = 0;
+        sprintf(result->error_msg, "NONE");
     }
+    // if terminated by signal
+    else if (WIFSIGNALED(status)) {
+        result->exit_code = -1;
+        result->signal = WTERMSIG(status);
+        
+        // tle
+        if (((result->signal == SIGXCPU) || (result->signal == SIGKILL)) && (result->exec_time > (task->max_cpu_time * 1000000))) sprintf(result->error_msg, "TLE");
+        // mle
+        else if ((memory_events_curr.max > memory_events_start.max) || (memory_events_curr.oom_kill > memory_events_start.oom_kill) || (memory_events_curr.oom > memory_events_start.oom)) sprintf(result->error_msg, "MLE");
+        // other signals
+        else sprintf(result->error_msg, "terminated by signal: %s", signal_name[result->signal]);
+    }
+
+    // convert cpu time from microseconds to milliseconds
+    // result->exec_time /= 1000;
+    // convert memory usage from bytes to kilobytes 
+    result->memory_used >>= 10;
 
     return;
 }
 
 TaskResult secure_execute(const Task *task) {
     TaskResult result;
+    result.exec_time = result.memory_used = 0;
     result.status = 0;
     result.exit_code = -1;
     result.signal = -1;
-    result.exec_time = result.memory_used = 0;
     result.error_msg = (char *)malloc(256);
     memset(result.error_msg, 0, sizeof(result.error_msg));
 
     // setup sandbox cgroup
-    int cgroup_fd = setup_sandbox_cgroup(task->max_memory);
+    int cgroup_fd = setup_sandbox_cgroup(task->max_memory, task->max_processes);
     if (cgroup_fd == -1) {
         sprintf(result.error_msg, "couldn't setup cgroup");
         return result;
@@ -257,24 +244,25 @@ TaskResult secure_execute(const Task *task) {
     cl_args.exit_signal = SIGCHLD;              // child will send SIGCHLD to parent when it exits
     
     errno = 0;
-    pid_t child = clone3(&cl_args);
+    pid_t pid = clone3(&cl_args);
 
     // before proceeding further we have to close the cgroup_fd, as we don't need it anymore
     close(cgroup_fd);
 
-    if (child == -1) {
+    if (pid == -1) {
         fprintf(stderr, "[X] clone3 error, couldn't create child process : %d\n", errno);
         return result;
     }
 
     // child process, never returns
-    if (child == 0) {
+    if (pid == 0) {
         sandbox(task);
         exit(0);
     }
 
     // parent process
-    monitor(task, child, &result);
+    monitor(pid, task, &result);
+    printf("euid: %d\n", geteuid());
 
     return result;     
 }
