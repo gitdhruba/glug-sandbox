@@ -160,10 +160,25 @@ unsigned long get_cpu_time() {
     return cpu_time;
 }
 
-// get memory usage from memory.peak file and reset it to 0 for next use
+// get peak memory usage from memory.peak file and reset it to 0 for next use
 unsigned long get_peak_memory_usage() {
     char memory_usage_path[256] = {0};
     sprintf(memory_usage_path, "%s/memory.peak", sandbox_cgroup);
+
+    FILE *memory_usage_file = fopen(memory_usage_path, "r");
+    if (memory_usage_file == NULL) return 0;
+
+    unsigned long memory_usage = 0;
+    fscanf(memory_usage_file, "%lu\n", &memory_usage);
+    fclose(memory_usage_file);
+
+    return memory_usage;
+}
+
+// get current memory usage memory.current file
+unsigned long get_current_memory_usage() {
+    char memory_usage_path[256] = {0};
+    sprintf(memory_usage_path, "%s/memory.current", sandbox_cgroup);
 
     FILE *memory_usage_file = fopen(memory_usage_path, "r");
     if (memory_usage_file == NULL) return 0;

@@ -112,7 +112,7 @@ void monitor(pid_t sandbox_pid, const Task *task, TaskResult *result) {
     int status = 0;
     int signal = 0;
     unsigned long cpu_time_start = 0, cpu_time_curr = 0;
-    unsigned long memory_used = 0;
+    unsigned long memory_used_max = 0, memory_used_curr = 0;;
     CgroupMemoryEvents memory_events_start, memory_events_curr;
     memset(&memory_events_start, 0, sizeof(memory_events_start));
     memset(&memory_events_curr, 0, sizeof(memory_events_curr));
@@ -120,19 +120,19 @@ void monitor(pid_t sandbox_pid, const Task *task, TaskResult *result) {
     // wait for child to call first execv() to run user program
     waitpid(sandbox_pid, &status, 0);
 
-    // check if child exited before execv()
-    if (WIFEXITED(status)) {
+    // check if child terminated before execv()
+    if (WIFEXITED(status) || WIFSIGNALED(status)) {
         result->exec_time = 0;
         result->memory_used = 0;
         sprintf(result->error_msg, "child exited before execv()");
         result->exit_code = WEXITSTATUS(status);
-        result->signal = -1;
-        printf("mempeak: %d\n", reset_memory_peak());
+        result->signal = WTERMSIG(status);
         return;
     }
 
+    // here we are sure that WIFSTOPPED(status) == true
     // if the stop signal is not SIGTRAP, then some error has occured. kill child
-    if (WIFSTOPPED(status) && (WSTOPSIG(status) != SIGTRAP)) {
+    if (WSTOPSIG(status) != SIGTRAP) {
         kill(sandbox_pid, SIGKILL);
 
         result->exec_time = 0;
@@ -148,8 +148,7 @@ void monitor(pid_t sandbox_pid, const Task *task, TaskResult *result) {
     // but before continuing ...
     // set PTRACE_O_EXITKILL option such that sandbox can't rescue even after monitor dies accidentally
     ptrace(PTRACE_SETOPTIONS, sandbox_pid, NULL, PTRACE_O_EXITKILL);
-    // reset memory.peak
-    reset_memory_peak();
+
     // get initial cpu time and memory events from cgroup
     get_memory_events(&memory_events_start);
     cpu_time_start = get_cpu_time();
@@ -163,8 +162,10 @@ void monitor(pid_t sandbox_pid, const Task *task, TaskResult *result) {
         pid_t res = waitpid(sandbox_pid, &status, WNOHANG);
         if (res == -1) break;
 
-        // get current cpu time and memory_events
+        // get current cpu time, memory usage and memory_events
         cpu_time_curr = get_cpu_time();
+        memory_used_curr = get_current_memory_usage();          
+        memory_used_max = ((memory_used_curr > memory_used_max) ? memory_used_curr : memory_used_max);
         get_memory_events(&memory_events_curr);
 
         // check if cpu time limit is exceeded or memory limit is exceeded
@@ -181,13 +182,14 @@ void monitor(pid_t sandbox_pid, const Task *task, TaskResult *result) {
     } while ((!WIFEXITED(status)) && (!WIFSIGNALED(status)));
     
     // at this point, we are sure that child has exited or terminated
-    // get cpu-time, peak memory usage and memory_events 
+    // get cpu-time,  memory usage and memory_events for last time
     cpu_time_curr = get_cpu_time();
-    memory_used = get_peak_memory_usage();
+    memory_used_curr = get_current_memory_usage();
+    memory_used_max = ((memory_used_curr > memory_used_max) ? memory_used_curr : memory_used_max);
     get_memory_events(&memory_events_curr);
 
     result->exec_time = (cpu_time_curr - cpu_time_start); 
-    result->memory_used = memory_used;  
+    result->memory_used = memory_used_max;  
     result->status = 1;
 
     // if exited normally
@@ -204,13 +206,16 @@ void monitor(pid_t sandbox_pid, const Task *task, TaskResult *result) {
         // tle
         if (((result->signal == SIGXCPU) || (result->signal == SIGKILL)) && (result->exec_time > (task->max_cpu_time * 1000000))) sprintf(result->error_msg, "TLE");
         // mle
-        else if ((memory_events_curr.max > memory_events_start.max) || (memory_events_curr.oom_kill > memory_events_start.oom_kill) || (memory_events_curr.oom > memory_events_start.oom)) sprintf(result->error_msg, "MLE");
+        else if ((memory_events_curr.max > memory_events_start.max) || (memory_events_curr.oom_kill > memory_events_start.oom_kill) || (memory_events_curr.oom > memory_events_start.oom)) {
+            result->memory_used = memory_used_max;
+            sprintf(result->error_msg, "MLE");
+        }
         // other signals
         else sprintf(result->error_msg, "terminated by signal: %s", signal_name[result->signal]);
     }
 
     // convert cpu time from microseconds to milliseconds
-    // result->exec_time /= 1000;
+    result->exec_time /= 1000;
     // convert memory usage from bytes to kilobytes 
     result->memory_used >>= 10;
 
@@ -262,7 +267,6 @@ TaskResult secure_execute(const Task *task) {
 
     // parent process
     monitor(pid, task, &result);
-    printf("euid: %d\n", geteuid());
 
     return result;     
 }
