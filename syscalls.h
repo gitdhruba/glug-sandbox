@@ -5,7 +5,9 @@
 
 
 #include <sys/syscall.h>
+#include <sys/prctl.h>
 #include <linux/sched.h>
+#include <linux/prctl.h>
 #include <unistd.h>
 
 

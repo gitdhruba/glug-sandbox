@@ -11,7 +11,7 @@
 #include <sys/stat.h>
 
 #define MAX_ALLOWED_MEMORY (512ull << 20)  // 512 MiB
-#define MAX_PIDS_LIMIT 1
+#define MAX_PIDS 16
 
 const char *root_cgroup = "/sys/fs/cgroup/user.slice";
 const char *sandbox_cgroup = "/sys/fs/cgroup/user.slice/sandbox";
@@ -104,8 +104,16 @@ int set_memory_limit(unsigned long high, unsigned long max) {
     return 0;
 }
 
+// set memory.oom.group
+int set_memory_oom_group() {
+    char memory_oom_group_path[256] = {0};
+    sprintf(memory_oom_group_path, "%s/memory.oom.group", sandbox_cgroup);
+    return write_to_file(memory_oom_group_path, "1");
+}
+
 // set pids limit for the cgroup
 int set_pids_limit(unsigned long max) {
+    max = (max > MAX_PIDS) ? MAX_PIDS : max;
     char pids_limit_path[256] = {0};
     char max_str[32];
 
@@ -122,7 +130,7 @@ int set_pids_limit(unsigned long max) {
 
 // setup sandbox cgroup for a given task 
 // return cgroup fd to be used in clone3
-// currently only applies limit on memory and pids controllers
+// currently only applies limits on memory and pids controllers
 int setup_sandbox_cgroup(unsigned long memory_limit, unsigned long pids_limit) {
     // create cgroup
     // assume that it is already created for now
@@ -130,6 +138,9 @@ int setup_sandbox_cgroup(unsigned long memory_limit, unsigned long pids_limit) {
 
     // set memory limit
     if (set_memory_limit(memory_limit, memory_limit) == -1) return -1;
+
+    // set memory.oom.group to 1 to consider whole cgroup as single for oom condition
+    if (set_memory_oom_group() == -1) return -1;
 
     // set pids limit
     if (set_pids_limit(pids_limit) == -1) return -1;
@@ -209,9 +220,24 @@ int get_memory_events(CgroupMemoryEvents *events) {
     return 0;
 }
 
-// reset memory.peak
-int reset_memory_peak() {
-    char memory_peak_path[256] = {0};
-    sprintf(memory_peak_path, "%s/memory.peak", sandbox_cgroup);
-    return write_to_file(memory_peak_path, "0");
+
+// kill all processes in cgroup (sig all)
+int kill_all(int sig) {
+    char cgroup_procs_path[256] = {0};
+    sprintf(cgroup_procs_path, "%s/cgroup.procs", sandbox_cgroup);
+    
+    FILE *cgroup_procs_file = fopen(cgroup_procs_path, "r");
+    if (cgroup_procs_file == NULL) {
+        fprintf(stderr, "[X] error killing processes\n");
+        return -1;
+    }
+
+    pid_t pids[MAX_PIDS + 1];
+    int i = 0, pid = -1;
+    while (fscanf(cgroup_procs_file, "%d\n", &pid) > 0) pids[i++] = pid;
+    fclose(cgroup_procs_file);
+
+    while (--i >= 0) kill(pids[i], sig);
+
+    return 0;
 }

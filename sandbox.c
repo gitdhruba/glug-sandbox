@@ -2,7 +2,9 @@
      Copyright (c) 2025 GNU/Linux Users' Group (NIT Durgapur)
      Author: Dhruba Sinha
 ************************************************************************/
+
 #define _GNU_SOURCE
+
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/time.h>
@@ -26,8 +28,6 @@
 #define MEMORYLIMIT_PADDING (getpagesize() << 16)
 #define COREDUMPLIMIT 0
 
-#define SYSCALL_STOPSIG (SIGTRAP | 0x80)
-
 #define ERR_SETSTDIN 11
 #define ERR_SETSTDOUT 12
 #define ERR_SETSTDERR 13
@@ -40,23 +40,20 @@
 #define ERR_EXEC 20
 #define ERR_SETUID 21
 #define ERR_NULLFD 22
+#define ERR_PRCTL  23
+
+#define ISFORKSTOP(status) ((status >> 8) == (SIGTRAP | (PTRACE_EVENT_FORK << 8)))
+#define ISVFORKSTOP(status) ((status >> 8) == (SIGTRAP | (PTRACE_EVENT_VFORK << 8)))
+#define ISEXECSTOP(status) ((status >> 8) == (SIGTRAP | (PTRACE_EVENT_EXEC << 8)))
 
 
-unsigned long get_memory_usage(pid_t pid) {
-    long page_size = getpagesize();
-    char filename[128];
-    sprintf(filename, "/proc/%d/statm", pid);
+// reap all zombies to make cgroup clean
+void reap_all() {
+    do {
+        errno = 0;
+    } while ((wait(NULL) > 0) || (errno == EINTR));
 
-    FILE *mem_usage_file = fopen(filename, "r");
-    if (mem_usage_file == NULL) return 0;
-
-    // first value is total VM size (in no of pages)
-    unsigned long mem_usage = 0;
-    fscanf(mem_usage_file, "%lu", &mem_usage);
-    mem_usage *= page_size;
-
-    fclose(mem_usage_file);
-    return mem_usage;
+    return;
 }
 
 
@@ -78,13 +75,16 @@ void sandbox(const Task *task) {
     resource_limit.rlim_max = resource_limit.rlim_cur = COREDUMPLIMIT;
     if (setrlimit(RLIMIT_CORE, &resource_limit) < 0) exit(ERR_SETCORELIMIT);
 
+    /********** no new privileges should be given on execve (may it be accidental or intentional) *********/
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1L, 0L, 0L, 0L) < 0) exit(ERR_PRCTL);
+
     /********** set user and group ids to unprivileged one ****************/
     if ((setgid(SANDBOX_GID) < 0) || (setuid(SANDBOX_UID) < 0)) exit(ERR_SETUID);
     if ((geteuid() != SANDBOX_UID) || (getegid() != SANDBOX_GID)) exit(ERR_SETUID);
 
     /********** change working directory **********/
-    if (chdir(task->work_dir) < 0) exit(ERR_CHDIR);
-
+    if (chdir(task->work_dir) < 0) exit(ERR_CHDIR);  
+    
     /********** set standard input/output/error files **********/
     if ((task->input_file == NULL) || (task->output_file == NULL) || (task->error_file == NULL)) exit(ERR_NULLFD);
     // set standard input
@@ -93,13 +93,10 @@ void sandbox(const Task *task) {
     if (freopen(task->output_file, "w", stdout) == NULL) exit(ERR_SETSTDOUT);
     // set standard error
     if (freopen(task->error_file, "w", stderr) == NULL) exit(ERR_SETSTDERR);
-
+    
     /********** start being traced by monitor ***********/
     if (ptrace(PTRACE_TRACEME, -1, NULL, NULL) < 0) exit(ERR_PTRACE);
-
-    // // now keep itself stopped until continued by parent
-    // raise(SIGSTOP);            
-
+       
     /********** execute task ***********/
     // (###)
     // ATTENTION: this is the very first exec() call which should be ignored in monitor, otherwise user program wouldn't be executed
@@ -107,23 +104,29 @@ void sandbox(const Task *task) {
 }
 
 
-
+// to monitor the sandbox
 void monitor(pid_t sandbox_pid, const Task *task, TaskResult *result) {
     int status = 0;
-    int signal = 0;
+    int signal = 0;                               
     unsigned long cpu_time_start = 0, cpu_time_curr = 0;
-    unsigned long memory_used_max = 0, memory_used_curr = 0;;
+    unsigned long memory_used_max = 0, memory_used_curr = 0;
+
     CgroupMemoryEvents memory_events_start, memory_events_curr;
     memset(&memory_events_start, 0, sizeof(memory_events_start));
     memset(&memory_events_curr, 0, sizeof(memory_events_curr));
+
+    // set monitor as nearest subreaper to give a proxy of an init process and clear cgroup properly
+    if (prctl(PR_SET_CHILD_SUBREAPER, 1) < 0) {
+        kill_all(SIGKILL);
+        sprintf(result->error_msg, "couldn't make monitor as subreaper");
+        return;
+    }
 
     // wait for child to call first execv() to run user program
     waitpid(sandbox_pid, &status, 0);
 
     // check if child terminated before execv()
     if (WIFEXITED(status) || WIFSIGNALED(status)) {
-        result->exec_time = 0;
-        result->memory_used = 0;
         sprintf(result->error_msg, "child exited before execv()");
         result->exit_code = WEXITSTATUS(status);
         result->signal = WTERMSIG(status);
@@ -133,35 +136,27 @@ void monitor(pid_t sandbox_pid, const Task *task, TaskResult *result) {
     // here we are sure that WIFSTOPPED(status) == true
     // if the stop signal is not SIGTRAP, then some error has occured. kill child
     if (WSTOPSIG(status) != SIGTRAP) {
-        kill(sandbox_pid, SIGKILL);
-
-        result->exec_time = 0;
-        result->memory_used = 0;
-        sprintf(result->error_msg, "child terminated before execv()");
-        result->exit_code = -1;
+        kill_all(SIGKILL);
+        reap_all();
+        sprintf(result->error_msg, "child terminated before execv() with signal %s", signal_name[WSTOPSIG(status)]);
+        result->exit_code = WEXITSTATUS(status);;
         result->signal = WSTOPSIG(status);
         
         return;
     }
 
-    // at this point, we are sure that child has called execv() and will start running user program
-    // but before continuing ...
-    // set PTRACE_O_EXITKILL option such that sandbox can't rescue even after monitor dies accidentally
-    ptrace(PTRACE_SETOPTIONS, sandbox_pid, NULL, PTRACE_O_EXITKILL);
+    // at this point sandbox is at exec() stop
 
     // get initial cpu time and memory events from cgroup
     get_memory_events(&memory_events_start);
     cpu_time_start = get_cpu_time();
 
-    // continue the child process
-    ptrace(PTRACE_CONT, sandbox_pid, NULL, 0);
+    // continue the sandbox process
+    ptrace(PTRACE_DETACH, sandbox_pid, 0, 0);
 
     // track cpu time , memory usage and child's state changes in a loop until child exits or is killed
+    pid_t pid = 0;
     do {
-        // get child state update using waitpid
-        pid_t res = waitpid(sandbox_pid, &status, WNOHANG);
-        if (res == -1) break;
-
         // get current cpu time, memory usage and memory_events
         cpu_time_curr = get_cpu_time();
         memory_used_curr = get_current_memory_usage();          
@@ -169,19 +164,28 @@ void monitor(pid_t sandbox_pid, const Task *task, TaskResult *result) {
         get_memory_events(&memory_events_curr);
 
         // check if cpu time limit is exceeded or memory limit is exceeded
+        // we still have to check for cpu time limit even after setting RLIMIT_CPU because user process may create multiple processes
         if (((cpu_time_curr - cpu_time_start) > (task->max_cpu_time * 1000000))  // tle
             || (memory_events_curr.max > memory_events_start.max)                // mle
-           ) kill(sandbox_pid, SIGKILL);
+           ) kill_all(SIGKILL);
 
-        // check for signal-delivery stop
-        if ((res != 0) && WIFSTOPPED(status)) {
-            // do nothing, let the signal be delivered to the child
-            ptrace(PTRACE_CONT, sandbox_pid, NULL, WSTOPSIG(status));   // this call may not be successful in case of tle
-        }
-        
-    } while ((!WIFEXITED(status)) && (!WIFSIGNALED(status)));
+        // get child state update using waitpid
+        status = 0;
+        errno = 0;
+        pid = waitpid(sandbox_pid, &status, WNOHANG);
+
+    } while (
+                (pid == 0)                          /* no state change */ 
+            || ((pid == -1) && (errno == EINTR))    /* we are interrupted inside waitpid() syscall, so try again (this should not happen as we had set WNOHANG.. but still to be on safe side :)) */
+        );
     
-    // at this point, we are sure that child has exited or terminated
+    // at this point, we are sure that sandbox has exited or terminated
+    // ensure all child have been terminated in case of multiple processes created by user program
+    kill_all(SIGKILL);
+
+    // reap_all() to clear cgroup properly
+    reap_all();
+
     // get cpu-time,  memory usage and memory_events for last time
     cpu_time_curr = get_cpu_time();
     memory_used_curr = get_current_memory_usage();
@@ -196,15 +200,15 @@ void monitor(pid_t sandbox_pid, const Task *task, TaskResult *result) {
     if (WIFEXITED(status)) {
         result->exit_code = WEXITSTATUS(status);
         result->signal = 0;
-        sprintf(result->error_msg, "NONE");
+        sprintf(result->error_msg, "exited using exit()");
     }
     // if terminated by signal
     else if (WIFSIGNALED(status)) {
-        result->exit_code = -1;
+        result->exit_code = WEXITSTATUS(status);
         result->signal = WTERMSIG(status);
         
         // tle
-        if (((result->signal == SIGXCPU) || (result->signal == SIGKILL)) && (result->exec_time > (task->max_cpu_time * 1000000))) sprintf(result->error_msg, "TLE");
+        if ((result->signal == SIGXCPU) || ((result->signal == SIGKILL) && (result->exec_time > (task->max_cpu_time * 1000000)))) sprintf(result->error_msg, "TLE (%s)", signal_name[result->signal]);
         // mle
         else if ((memory_events_curr.max > memory_events_start.max) || (memory_events_curr.oom_kill > memory_events_start.oom_kill) || (memory_events_curr.oom > memory_events_start.oom)) {
             result->memory_used = memory_used_max;
@@ -219,8 +223,10 @@ void monitor(pid_t sandbox_pid, const Task *task, TaskResult *result) {
     // convert memory usage from bytes to kilobytes 
     result->memory_used >>= 10;
 
+
     return;
 }
+
 
 TaskResult secure_execute(const Task *task) {
     TaskResult result;
@@ -241,8 +247,8 @@ TaskResult secure_execute(const Task *task) {
     // create child process for executing task using clone3() syscall 
     struct clone_args cl_args;
     memset(&cl_args, 0, sizeof(cl_args));
-    cl_args.flags = (     CLONE_NEWPID          // new pid namespace to prevent dangerous syscalls like kill(), reboot() etc from hampering the host
-                        | CLONE_CLEAR_SIGHAND   // restore signal handlers to default
+    cl_args.flags = (     
+                          CLONE_CLEAR_SIGHAND   // restore signal handlers to default
                         | CLONE_INTO_CGROUP     // attach to cgroup while creating the child, as doing it later will slower
                     );
     cl_args.cgroup = cgroup_fd;                 // cgroup fd to be used in clone3
@@ -255,18 +261,19 @@ TaskResult secure_execute(const Task *task) {
     close(cgroup_fd);
 
     if (pid == -1) {
-        fprintf(stderr, "[X] clone3 error, couldn't create child process : %d\n", errno);
-        return result;
+        sprintf(result.error_msg, "[X] clone3 error, couldn't create child process");
     }
 
     // child process, never returns
-    if (pid == 0) {
+    else if (pid == 0) {
         sandbox(task);
-        exit(0);
+        exit(EXIT_FAILURE);
     }
 
     // parent process
-    monitor(pid, task, &result);
+    else {
+        monitor(pid, task, &result);
+    }
 
     return result;     
 }
